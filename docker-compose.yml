@@ -1,0 +1,25 @@
+# A throwaway Postgres with pgvector, so the quickstart is one command and
+# nothing lands on a database you care about.
+#
+# The data lives in a named volume rather than a bind mount: the demo corpus is
+# ~20k rows of 768-dimension vectors, and bind-mounted Postgres data on macOS
+# and Windows goes through a filesystem translation layer that makes the
+# embedding writes several times slower.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: corpusmap
+      POSTGRES_PASSWORD: corpusmap
+      POSTGRES_DB: corpusmap
+    ports:
+      - "5433:5432"        # 5433, to stay out of the way of a local Postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U corpusmap"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  pgdata:

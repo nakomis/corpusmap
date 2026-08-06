@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Check out the post-merge state on PRs so CI validates what will land on main.
+env:
+  CHECKOUT_REF: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e '.[fast,dev]'
+      # The suite is deliberately database-free and dataset-free, so CI needs
+      # neither a Postgres service nor a 59 MB download.
+      - run: pytest -q --cov=corpusmap --cov-report=term-missing

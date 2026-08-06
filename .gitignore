@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Planning
+PLAN.md
+
+# Corpus cache and build output
+.cache/
+build/
+data/*.dump
+data/*.sql.gz
+
