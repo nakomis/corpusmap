@@ -1,5 +1,7 @@
 # corpusmap — Cluster and label any text dataset
 
+![A dark bookshelf lit by a single shaft of light, picking out the gilt spines of the eight public-domain books in the demo corpus: On the Origin of Species and The Voyage of the Beagle by Charles Darwin, Moby Dick by Herman Melville, Twenty Thousand Leagues Under the Sea by Jules Verne, Pride and Prejudice by Jane Austen, The Adventures of Sherlock Holmes by Arthur Conan Doyle, The Book of Household Management by Mrs Beeton, and Meditations by Marcus Aurelius](docs/bookshelf-authors.png)
+
 ## Support
 
 If you find this useful, please consider buying me a coffee:
