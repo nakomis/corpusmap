@@ -41,6 +41,17 @@ def _corpus_args(p: argparse.ArgumentParser) -> None:
         "because UMAP projections do not compose.",
     )
     p.add_argument("--where", default=None, help="extra SQL predicate")
+    p.add_argument(
+        "--meta-cols",
+        default=None,
+        help="comma-separated display-only columns shown on the viewer's hover "
+        "card (e.g. title,author,chapter). Never used by the mathematics.",
+    )
+
+
+def _meta_cols(a: argparse.Namespace) -> tuple[str, ...]:
+    raw = getattr(a, "meta_cols", None)
+    return tuple(c.strip() for c in raw.split(",") if c.strip()) if raw else ()
 
 
 def _corpus(a: argparse.Namespace) -> Corpus:
@@ -52,6 +63,7 @@ def _corpus(a: argparse.Namespace) -> Corpus:
         vector_col=a.vector_col,
         facet_col=getattr(a, "facet_col", None),
         where=a.where,
+        meta_cols=_meta_cols(a),
     )
 
 
@@ -71,6 +83,23 @@ def _projection_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--out", default="build", help="output directory")
     p.add_argument("--prefix", default="map")
+    p.add_argument(
+        "--no-viewer",
+        action="store_true",
+        help="skip the self-contained HTML map and write only the JSON artefacts",
+    )
+    p.add_argument(
+        "--corpus-name",
+        default=None,
+        help="name shown in the viewer's panel (default: the table name)",
+    )
+    p.add_argument(
+        "--snippet-chars",
+        type=int,
+        default=320,
+        help="how much of each document the viewer's hover card shows. This is "
+        "the main lever on the size of the HTML artefact.",
+    )
 
 
 def _llm_args(p: argparse.ArgumentParser) -> None:
@@ -176,13 +205,42 @@ def _do_label(a: argparse.Namespace, projections: list) -> list[dict]:
     return docs
 
 
+def _emit(a: argparse.Namespace, docs: list[dict]) -> None:
+    """Write the JSON artefacts and, unless told not to, the viewer."""
+    path = write(a.out, a.prefix, docs, extra={"corpusmap": __version__})
+    print(f"wrote {path}")
+    if getattr(a, "no_viewer", False):
+        return
+
+    from . import pack
+    from .db import fetch_meta
+    from .export import write_docs
+
+    # The hover-card table is written as its own artefact rather than folded
+    # into the projections, so that `corpusmap view` can rebuild the HTML later
+    # without a database to hand.
+    corpus = _corpus(a)
+    write_docs(
+        a.out,
+        a.prefix,
+        docs,
+        text_by_id=fetch_text(corpus),
+        meta_by_id=fetch_meta(corpus),
+        meta_names=list(corpus.meta_cols),
+        snippet_chars=a.snippet_chars,
+    )
+    html = pack.build_from_dir(
+        a.out, a.prefix, corpus=getattr(a, "corpus_name", None) or a.table
+    )
+    print(f"wrote {html}  <- open this")
+
+
 def cmd_project(a: argparse.Namespace) -> int:
     projections = _do_project(a)
     docs = [projection_doc(p) for p in projections]
-    path = write(a.out, a.prefix, docs, extra={"corpusmap": __version__})
     # Coordinates are cached so `label` can run without re-fitting.
     _save_state(a, projections)
-    print(f"wrote {path}")
+    _emit(a, docs)
     return 0
 
 
@@ -190,18 +248,23 @@ def cmd_label(a: argparse.Namespace) -> int:
     projections = _load_state(a)
     if not projections:
         sys.exit(f"no cached projections under {a.out}; run `corpusmap project` first")
-    docs = _do_label(a, projections)
-    path = write(a.out, a.prefix, docs, extra={"corpusmap": __version__})
-    print(f"wrote {path}")
+    _emit(a, _do_label(a, projections))
     return 0
 
 
 def cmd_run(a: argparse.Namespace) -> int:
     projections = _do_project(a)
     _save_state(a, projections)
-    docs = _do_label(a, projections)
-    path = write(a.out, a.prefix, docs, extra={"corpusmap": __version__})
-    print(f"wrote {path}")
+    _emit(a, _do_label(a, projections))
+    return 0
+
+
+def cmd_view(a: argparse.Namespace) -> int:
+    """Rebuild the viewer from artefacts a previous run already wrote."""
+    from . import pack
+
+    html = pack.build_from_dir(a.out, a.prefix, out_path=a.html, corpus=a.corpus)
+    print(f"wrote {html}")
     return 0
 
 
@@ -282,6 +345,15 @@ def build_parser() -> argparse.ArgumentParser:
     _projection_args(ru)
     _llm_args(ru)
     ru.set_defaults(func=cmd_run)
+
+    vi = sub.add_parser(
+        "view", help="rebuild the self-contained HTML map from existing artefacts"
+    )
+    vi.add_argument("--out", default="build", help="directory holding the artefacts")
+    vi.add_argument("--prefix", default="map")
+    vi.add_argument("--html", default=None, help="output path (default <out>/<prefix>.html)")
+    vi.add_argument("--corpus", default=None, help="name shown in the panel")
+    vi.set_defaults(func=cmd_view)
 
     return p
 

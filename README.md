@@ -12,7 +12,7 @@ what your corpus is *about* — as a set of named clusters and a 3D map you can
 draw.
 
 ```
-text -> embeddings -> normalise -> PCA -> UMAP(3) -> HDBSCAN -> c-TF-IDF -> LLM label
+text -> embeddings -> normalise -> PCA -> UMAP(3) -> HDBSCAN -> c-TF-IDF -> LLM label -> map
 ```
 
 Nothing here is specific to one dataset. It came out of a system that maps
@@ -32,6 +32,7 @@ and the tool cannot tell the difference.
   * [Labels come from c-TF-IDF, not from the model](#labels-come-from-c-tf-idf-not-from-the-model)
   * [The grounding check](#the-grounding-check)
   * [Labelling is 98% of the runtime](#labelling-is-98%25-of-the-runtime)
+  * [The map itself](#the-map-itself)
   * [Facets need their own fit](#facets-need-their-own-fit)
 - [The demo dataset](#the-demo-dataset)
   * [Download](#download)
@@ -63,26 +64,30 @@ export DSN=postgresql://corpusmap:corpusmap@127.0.0.1:5433/corpusmap
 # Embed, project, cluster, label
 .venv/bin/corpusmap embed --dsn "$DSN" --model nomic-embed-text --workers 8
 .venv/bin/corpusmap run   --dsn "$DSN" --facet-col category \
+                          --meta-cols title,author,chapter \
                           --out build --prefix gutenberg --llm llama3.2:3b
+
+open build/gutenberg.html
 ```
 
 Or skip the embedding entirely and
 [download the pre-built dataset](#the-demo-dataset).
 
-The result is `build/gutenberg-*.json` — one file per facet plus a manifest.
-The largest clusters in `gutenberg-all.json` on a reference run:
+The result is `build/gutenberg.html` — one self-contained file you can
+double-click, plus the underlying `build/gutenberg-*.json` if you would rather
+render it yourself. The largest clusters on a reference run:
 
 ```
-   980  thou, unto, thee
-   845  elizabeth, darcy, bennet
-   816  Whaling and Whalemen Culture
-   737  Nautical Mathematics and Slang
-   402  holmes, sherlock, said
-   361  Jane Austen Literary Analysis
-   276  Jules Verne's Nautilus Adventure
-   234  stewpan, simmer, put
-   214  Birds and Pigeon Breeds
-   136  Plant Breeding and Sterility
+  1057  thou, unto, doth
+   763  Whaling and its Culture
+   640  boil, butter, put
+   486  Personal Letters from Elizabeth Bennet
+   461  ahab, ship, captain
+   345  holmes, sherlock, said
+   334  Birds and their characteristics
+   330  Traveling through mountainous country scenery
+   267  Jules Verne's Captain Nemo
+   210  pepper, teaspoonful, salt
 ```
 
 Which is the point: the recipes separated from the marine biology without being
@@ -116,6 +121,7 @@ If your vector column is already populated by something upstream, skip
 | `corpusmap project` | vectors -> 3D coordinates + cluster ids | ~1% |
 | `corpusmap label` | cluster ids -> English names | **~98%** |
 | `corpusmap run` | project then label, in one go | |
+| `corpusmap view` | rebuild the HTML map from existing artefacts | seconds |
 
 `project` and `label` are separate on purpose. The fit is cached to
 `build/<prefix>-state.npz`, so you can re-run labelling with a different stop
@@ -235,6 +241,44 @@ Three things here address that, cheapest first:
 3. **`--llm-workers`.** The calls are independent; serial calling leaves a
    straight multiple on the table.
 
+### The map itself
+
+`run` finishes by writing **one self-contained HTML file**. No server, no build
+step, no CDN — open it from `file://`, or mail it to someone.
+
+That constraint is why it is raw WebGL rather than three.js: vendoring ~600 KB
+of scene graph to draw a point cloud with fixed positions and no scene to graph
+would be a poor trade. It is one buffer and one draw call, and the spheres are
+imposters — flat points whose normals are reconstructed in the fragment shader,
+so they light like balls without a single instanced mesh.
+
+- **Hover a sphere** to read the actual passage, with whatever `--meta-cols`
+  carried through (`title,author,chapter` for the demo corpus) and the cluster
+  it landed in. This is the answer to "what *is* that dot", which is the first
+  thing anyone asks of a point cloud and the one question a scatter plot cannot
+  answer.
+- **Click** to isolate a cluster; everything else dims rather than disappearing,
+  because a cluster floating in empty space loses the context that made the map
+  worth drawing.
+- **Switch facets** in the panel. Each was fitted separately, so the geometry
+  genuinely changes rather than filtering.
+- Cluster names are DOM elements, not WebGL text: they stay crisp at every zoom
+  and are placed by greedy screen-space collision rejection, largest cluster
+  first. Zoom in and smaller topics appear as the centroids separate.
+
+Coordinates are quantised to int16 over each projection's bounding box before
+inlining. UMAP output is a *relative* layout with no meaningful units, so
+1/65,536 of the extent is far below anything you or the renderer can resolve —
+and it takes a node from ~40 bytes of JSON to 12 bytes of binary.
+
+The demo map is 4.8 MB, almost all of it hover-card text. `--snippet-chars` is
+the lever on that; `--no-viewer` skips it entirely.
+
+```bash
+# Rebuild the HTML from artefacts a previous run left behind — no database needed
+corpusmap view --out build --prefix gutenberg --corpus "Project Gutenberg"
+```
+
 ### Facets need their own fit
 
 `--facet-col` splits the corpus by a column and fits **each value separately**.
@@ -252,13 +296,27 @@ dimensions).
 
 | Category | Passages | Books |
 |---|---|---|
-| `fiction-adventure` | 4,078 | *Moby Dick*, *Twenty Thousand Leagues under the Sea* |
-| `science-travel` | 2,500 | *The Voyage of the Beagle* |
-| `reference-cookery` | 2,500 | *The Book of Household Management* |
-| `science-biology` | 2,073 | *On the Origin of Species* |
-| `fiction-social` | 1,942 | *Pride and Prejudice* |
-| `fiction-detective` | 1,505 | *The Adventures of Sherlock Holmes* |
-| `philosophy` | 936 | *Meditations* |
+| `fiction-adventure` | 4,078 | *Moby Dick* (2701), *Twenty Thousand Leagues under the Sea* (164) |
+| `science-travel` | 2,500 | *The Voyage of the Beagle* (944) |
+| `reference-cookery` | 2,500 | *The Book of Household Management* (10136) |
+| `science-biology` | 2,073 | *On the Origin of Species* (1228) |
+| `fiction-social` | 1,942 | *Pride and Prejudice* (1342) |
+| `fiction-detective` | 1,505 | *The Adventures of Sherlock Holmes* (1661) |
+| `philosophy` | 936 | *Meditations* (2680) |
+
+Each row also carries `title`, `author` and `chapter`, which the viewer shows
+on its hover card. Gutenberg plain text has no page numbers — pagination is a
+property of a printed edition and does not survive the conversion — so the
+chapter heading is the only structural landmark available. Coverage is 97-100%
+per book.
+
+The bracketed numbers are Project Gutenberg ebook ids, and the builder asserts
+that each download's `Title:` line matches before inserting a row. That check
+exists because the first version of this list had two ids wrong: 10681 is
+Roget's Thesaurus, not Mrs Beeton, and the pipeline happily clustered a
+thesaurus under "reference-cookery" without anything looking obviously broken.
+An id typo is invisible in the output — it just quietly makes the dataset a
+lie.
 
 Eight books rather than one because a single novel clusters badly — one author,
 one register, one subject, so the map comes out a single smear. A deliberately
@@ -299,6 +357,8 @@ useless twice). See [datasets/SOURCES.md](datasets/SOURCES.md).
 | `corpusmap/` | the library and CLI |
 | `corpusmap/project.py` | normalise, PCA, UMAP, HDBSCAN |
 | `corpusmap/label.py` | c-TF-IDF, the LLM pass, the grounding check |
+| `corpusmap/viewer.html` | the WebGL map — dependency-free, opens from `file://` |
+| `corpusmap/pack.py` | quantises and inlines the data into that template |
 | `datasets/build_gutenberg.py` | builds the demo corpus from Project Gutenberg |
 | `tests/` | pytest suite; no database or dataset needed |
 | `docker-compose.yml` | throwaway Postgres + pgvector on port 5433 |

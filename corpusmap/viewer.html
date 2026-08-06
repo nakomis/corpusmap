@@ -1,0 +1,879 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>corpusmap</title>
+<!--
+  Standalone 3D corpus map.
+
+  Deliberately dependency-free. The artefact has to open from file:// with no
+  network access of any kind — no CDN, no fetch, not even localhost — because
+  it exists to be double-clicked, mailed to someone, or opened on a laptop with
+  no route home. Three.js would have meant vendoring ~600 KB to draw a point
+  cloud with fixed positions and no scene graph, so this is raw WebGL instead:
+  one buffer, one draw call.
+
+  WebGL1 (attribute/varying, gl_FragColor) rather than WebGL2: the shaders use
+  nothing WebGL2 offers, and WebGL1 has broader support with no fallback path
+  to maintain.
+
+  Data is inlined as base64 int16 by pack.py. See that file for why.
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+    background: #0b0d11; color: #c9d1d9;
+    font: 13px/1.5 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif; }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+
+  #panel { position: fixed; top: 16px; left: 16px; width: 258px;
+    max-height: calc(100% - 60px); overflow-y: auto;
+    background: rgba(16,19,25,.88); backdrop-filter: blur(12px);
+    border: 1px solid #232a35; border-radius: 10px; padding: 14px 16px; }
+  h1 { font-size: 13px; margin: 0 0 2px; letter-spacing: .01em; }
+  .sub { color: #6e7681; font-size: 11px; margin-bottom: 12px; }
+  fieldset { border: 0; padding: 0; margin: 0 0 12px; }
+  legend { font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+    color: #6e7681; padding: 0 0 6px; }
+  label { display: flex; align-items: center; gap: 8px; padding: 3px 0;
+    cursor: pointer; user-select: none; }
+  label:hover { color: #fff; }
+  input[type=radio] { accent-color: #4c8eda; width: 14px; height: 14px; margin: 0; }
+  .count { margin-left: auto; color: #6e7681; font-variant-numeric: tabular-nums; }
+  .stats { border-top: 1px solid #232a35; padding-top: 10px;
+    color: #8b949e; font-size: 11px; }
+  .stats b { color: #c9d1d9; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .sel { color: #7fb3f0; margin-top: 6px; }
+  .terms { color: #6e7681; font-size: 10px; margin-top: 3px; line-height: 1.5; }
+  input[type=range] { width: 100%; accent-color: #4c8eda; margin: 4px 0 6px; }
+  .row { display: flex; justify-content: space-between; font-size: 11px;
+    color: #8b949e; margin: 2px 0; }
+  .row b { color: #c9d1d9; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .note { color: #6e7681; font-size: 10px; line-height: 1.45; margin-top: 8px; }
+  /* Cluster names are DOM, not WebGL. Text in a point cloud needs a font
+     atlas, per-glyph quads and a shader that fights the depth buffer; an
+     absolutely-positioned div needs a projected centroid and nothing else,
+     and it stays crisp at every zoom because it is never rasterised into a
+     texture. pointer-events stay off so labels never intercept a click meant
+     for the sphere underneath. */
+  #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+  #labels div { position: absolute; transform: translate(-50%, -50%);
+    white-space: nowrap; font-size: 11px; letter-spacing: .01em;
+    color: #c9d1d9; text-shadow: 0 0 4px #0b0d11, 0 0 8px #0b0d11; }
+  #labels div.sel { color: #ffe27a; font-size: 12px; font-weight: 600; }
+
+  /* Hover card. Follows the cursor rather than anchoring to the sphere: the
+     sphere is a few pixels across and an anchored card would cover the very
+     thing being inspected, plus its neighbours. */
+  #card { position: fixed; display: none; max-width: 380px; z-index: 5;
+    pointer-events: none; background: rgba(16,19,25,.95);
+    backdrop-filter: blur(12px); border: 1px solid #2b3441;
+    border-radius: 9px; padding: 10px 12px;
+    box-shadow: 0 8px 28px rgba(0,0,0,.55); }
+  #card .quote { color: #dbe3ea; font-size: 12px; line-height: 1.55; }
+  #card .meta { color: #8b949e; font-size: 11px; margin-top: 8px;
+    padding-top: 7px; border-top: 1px solid #232a35; }
+  #card .meta b { color: #c9d1d9; font-weight: 600; }
+  #card .topic { color: #7fb3f0; font-size: 11px; margin-top: 5px; }
+
+  #hint { position: fixed; bottom: 14px; left: 16px; color: #4b535e; font-size: 11px; }
+  #err { position: fixed; inset: 0; display: none; place-items: center;
+    padding: 40px; text-align: center; color: #f85149; }
+</style>
+
+<canvas id="c"></canvas>
+
+<div id="panel">
+  <h1>corpusmap</h1>
+  <div class="sub" id="corpus"></div>
+
+  <fieldset id="facets">
+    <legend>Projection</legend>
+  </fieldset>
+
+  <fieldset>
+    <legend>Display</legend>
+    <div class="row"><span>point size</span><b id="size-v">18</b></div>
+    <input type="range" id="size" min="4" max="60" step="1" value="18">
+  </fieldset>
+
+  <div class="stats">
+    <div><b id="s-nodes">0</b> points · <b id="s-clusters">0</b> clusters</div>
+    <div id="s-dropped"></div>
+    <div id="s-selected" class="sel"></div>
+    <div id="s-terms" class="terms"></div>
+  </div>
+  <div class="note">Cluster membership is meaningful. The distance between
+    clusters is not — UMAP preserves neighbours, not global geometry.</div>
+</div>
+
+<div id="labels"></div>
+<div id="card"></div>
+<div id="hint">hover a sphere to read it · drag to rotate · scroll to zoom · shift-drag to pan · click to select a cluster</div>
+<div id="err"></div>
+
+<script>
+"use strict";
+
+// pack.py substitutes the placeholder comment below *and* the empty object
+// after it, as one token — so this file stays valid JavaScript unpacked and
+// valid once packed. Replacing only the comment would leave the original
+// literal stranded after the injected object.
+//
+// The token is deliberately not written out in this comment. In the viewer
+// this was ported from it was, and str.replace substituted there too: the
+// bundle inlined its payload twice and came out at double size, silently,
+// because the first copy landed inside a comment and the page still worked.
+// pack.py now refuses to run unless the token appears exactly once.
+const BUNDLE = /*__DATA__*/{};
+
+const PROJECTIONS = BUNDLE.projections || {};
+const CORPUS = BUNDLE.corpus || "corpus";
+// One shared table of [snippet, ...meta] rows, indexed by the uint32 each node
+// carries. Facets overlap heavily — every point in `all` appears in exactly one
+// other facet too — so storing the text per node would carry the corpus twice.
+const DOCS = BUNDLE.docs || [];
+const META_NAMES = BUNDLE.meta_names || [];
+
+// int16 x,y,z + uint16 cluster + uint32 doc. No author byte: corpusmap keeps
+// each facet in its own projection rather than colouring one fit by author, so
+// there is nothing else per-node left to carry.
+const STRIDE = 12;
+const NO_DOC = 0xFFFFFFFF;
+
+const canvas = document.getElementById("c");
+
+function fail(msg) {
+  const e = document.getElementById("err");
+  e.style.display = "grid";
+  e.textContent = msg;
+}
+
+/** Decode one packed projection into typed arrays ready for the GPU. */
+function decode(p) {
+  const bin = atob(p.data);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const dv = new DataView(bytes.buffer);
+  const n = p.n;
+
+  const pos = new Float32Array(n * 3);
+  const cluster = new Uint16Array(n);
+  const doc = new Uint32Array(n);
+  // Dequantise back into a cube of radius RADIUS about the origin. The camera
+  // defaults are expressed in these units, so every projection — 500 points or
+  // 50,000 — frames identically on load.
+  const RADIUS = 100;
+  for (let i = 0; i < n; i++) {
+    const o = i * STRIDE;
+    for (let a = 0; a < 3; a++) {
+      const q = dv.getInt16(o + a * 2, true);
+      pos[i * 3 + a] = ((q + 32768) / 65535) * 2 * RADIUS - RADIUS;
+    }
+    cluster[i] = dv.getUint16(o + 6, true);
+    doc[i] = dv.getUint32(o + 8, true);
+  }
+  return { pos, cluster, doc, n, meta: p };
+}
+
+/**
+ * Colour per cluster, by golden-angle hue rotation.
+ *
+ * Adjacent cluster ids are unrelated — HDBSCAN numbers them arbitrarily — so
+ * a sequential ramp would imply an ordering that does not exist. The golden
+ * angle keeps neighbouring ids maximally far apart in hue instead.
+ */
+function clusterColours(maxId) {
+  const c = new Float32Array((maxId + 1) * 3);
+  for (let i = 0; i <= maxId; i++) {
+    const h = (i * 137.508) % 360;
+    const [r, g, b] = hsl(h / 360, 0.62, 0.62);
+    c[i * 3] = r; c[i * 3 + 1] = g; c[i * 3 + 2] = b;
+  }
+  return c;
+}
+function hsl(h, s, l) {
+  const f = (n) => {
+    const k = (n + h * 12) % 12;
+    return l - s * Math.min(l, 1 - l) * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+
+// ---------------------------------------------------------------------------
+// Matrices — column-major Float32Array(16), which is what uniformMatrix4fv
+// expects with transpose = false. Passing a row-major matrix there is a silent
+// failure that renders a black screen, so the convention never varies.
+// ---------------------------------------------------------------------------
+
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+
+function lookAt(eye, centre, up) {
+  const z = norm3([eye[0] - centre[0], eye[1] - centre[1], eye[2] - centre[2]]);
+  const x = norm3(cross3(up, z));
+  const y = cross3(z, x);
+  return new Float32Array([
+    x[0], y[0], z[0], 0,
+    x[1], y[1], z[1], 0,
+    x[2], y[2], z[2], 0,
+    -dot3(x, eye), -dot3(y, eye), -dot3(z, eye), 1,
+  ]);
+}
+
+function multiply(a, b) {
+  const m = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      m[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+                     a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return m;
+}
+
+function norm3(v) { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0]/l, v[1]/l, v[2]/l]; }
+function cross3(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+function dot3(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+
+// ---------------------------------------------------------------------------
+// Shaders
+// ---------------------------------------------------------------------------
+
+const POINT_VERT = `
+attribute vec3 aPos;
+attribute vec3 aColor;
+attribute float aVisible;
+uniform mat4 uMVP;
+uniform float uSize;
+varying vec3 vColor;
+varying float vVisible;
+varying float vSize;
+varying vec3 vSeed;
+void main() {
+  gl_Position = uMVP * vec4(aPos, 1.0);
+  // Perspective-correct sizing, clamped so distant points stay visible and
+  // near ones do not become blobs.
+  // The 180 calibrates the slider's 4..60 range against the fixed radius of
+  // 100 the packer dequantises into, so the default framing shows spheres of
+  // about 10px rather than points at the clamp floor.
+  gl_PointSize = clamp(uSize * 180.0 / max(gl_Position.w, 0.001), 2.0, 46.0);
+  vColor = aColor;
+  vVisible = aVisible;
+  vSize = gl_PointSize;
+  // World position doubles as a per-sphere random seed, so neighbouring
+  // spheres get different surface patterns rather than a repeated stamp.
+  vSeed = aPos;
+}`;
+
+const POINT_FRAG = `
+precision mediump float;
+varying vec3 vColor;
+varying float vVisible;
+varying float vSize;
+varying vec3 vSeed;
+
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+// Smooth value noise. Cheap enough to afford twice per fragment, which is
+// what the bump gradient below needs.
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+             mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+
+// Sphere imposter: the geometry is still a flat point, but the normal is
+// reconstructed as though the disc were a sphere and then lit. A real sphere
+// mesh would mean thousands of instanced draws; this costs one extra sqrt per
+// fragment and reads as a lit ball rather than a sticker.
+void main() {
+  if (vVisible < 0.5) discard;
+
+  vec2 d = gl_PointCoord * 2.0 - 1.0;   // -1..1 across the point
+  float r2 = dot(d, d);
+  if (r2 > 1.0) discard;                // outside the sphere's silhouette
+
+  // z on the unit sphere; y flipped because gl_PointCoord runs top-down.
+  vec3 N = vec3(d.x, -d.y, sqrt(1.0 - r2));
+
+  // Surface texture, faded in by apparent size. Below ~7px a sphere is too
+  // small to show relief and the noise would read as dithering, so it is
+  // suppressed entirely; it emerges as you zoom in.
+  float detail = smoothstep(6.0, 20.0, vSize);
+  if (detail > 0.001) {
+    // Offset the noise field per sphere so neighbours differ.
+    vec2 uv = d * 4.5 + vec2(hash(vSeed.xy), hash(vSeed.yz)) * 32.0;
+    float e = 0.35;
+    // Central difference across the noise field gives a bump gradient; nudging
+    // the normal by it is what catches the light, rather than just tinting.
+    vec2 grad = vec2(noise(uv + vec2(e, 0.0)) - noise(uv - vec2(e, 0.0)),
+                     noise(uv + vec2(0.0, e)) - noise(uv - vec2(0.0, e)));
+    N = normalize(N + vec3(grad, 0.0) * detail * 0.9);
+  }
+
+  vec3 L = normalize(vec3(-0.35, 0.55, 0.75));
+
+  float diff = max(dot(N, L), 0.0);
+  float spec = pow(max(dot(reflect(-L, N), vec3(0.0, 0.0, 1.0)), 0.0), 28.0);
+  // Rim term: a touch of brightness at the silhouette separates overlapping
+  // spheres from each other, which matters a lot in the dense clusters.
+  float rim  = pow(1.0 - N.z, 2.5) * 0.30;
+
+  vec3 col = vColor * (0.28 + 0.72 * diff) + vec3(spec * 0.45 + rim);
+
+  // Antialias the silhouette only in the last few percent of the radius, so
+  // the sphere stays solid and depth-testable rather than half-transparent.
+  float alpha = 1.0 - smoothstep(0.92, 1.0, r2);
+  gl_FragColor = vec4(col, alpha);
+}`;
+
+// ---------------------------------------------------------------------------
+// GL setup
+// ---------------------------------------------------------------------------
+
+const gl = canvas.getContext("webgl", { antialias: true, alpha: false });
+if (!gl) fail("This browser has no WebGL. The map needs it to draw.");
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(s) || "shader compile failed");
+  }
+  return s;
+}
+
+let program, aPos, aColor, aVisible, uMVP, uSize;
+let bufPos, bufColor, bufVisible;
+
+if (gl) {
+  program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, POINT_VERT));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, POINT_FRAG));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    fail(gl.getProgramInfoLog(program) || "shader link failed");
+  }
+  aPos = gl.getAttribLocation(program, "aPos");
+  aColor = gl.getAttribLocation(program, "aColor");
+  aVisible = gl.getAttribLocation(program, "aVisible");
+  uMVP = gl.getUniformLocation(program, "uMVP");
+  uSize = gl.getUniformLocation(program, "uSize");
+  bufPos = gl.createBuffer();
+  bufColor = gl.createBuffer();
+  bufVisible = gl.createBuffer();
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0.043, 0.051, 0.067, 1);
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+let current = null;          // decoded projection
+let colours = null;          // Float32Array, per-vertex colour
+let visible = null;          // Float32Array, per-vertex 0/1
+let centroids = null;        // cluster id -> [x, y, z]
+let selected = null;         // cluster id or null
+let pointSize = 18;
+
+// distance 420 frames the whole cube on load: the packer dequantises into a
+// cube of radius 100, whose corner sits at 100*sqrt(3) = 173, and a 45 degree
+// vertical field of view needs 173/tan(22.5) to contain it.
+const cam = { theta: 0.6, phi: 1.1, distance: 420, target: [0, 0, 0] };
+const PHI_LIMIT = 0.01;
+
+function eye() {
+  return [
+    cam.target[0] + cam.distance * Math.sin(cam.phi) * Math.cos(cam.theta),
+    cam.target[1] + cam.distance * Math.cos(cam.phi),
+    cam.target[2] + cam.distance * Math.sin(cam.phi) * Math.sin(cam.theta),
+  ];
+}
+
+function viewProjection(aspect) {
+  // far is generous relative to the radius of 100 so a zoomed-out map is never
+  // clipped; near is not tiny, because a near/far ratio that large costs depth
+  // precision and makes overlapping spheres z-fight.
+  return multiply(perspective(Math.PI / 4, aspect, 1, 6000), lookAt(eye(), cam.target, [0, 1, 0]));
+}
+
+// ---------------------------------------------------------------------------
+// Loading a projection
+// ---------------------------------------------------------------------------
+
+function load(name) {
+  const packed = PROJECTIONS[name];
+  if (!packed) return;
+  current = decode(packed);
+  selected = null;
+
+  let maxId = 0;
+  for (let i = 0; i < current.n; i++) if (current.cluster[i] > maxId) maxId = current.cluster[i];
+  // Assigned before anything can read it: applySelection() indexes straight
+  // into current.palette, so building it late leaves the first paint reading
+  // undefined and the canvas blank.
+  current.palette = clusterColours(maxId);
+
+  colours = new Float32Array(current.n * 3);
+  visible = new Float32Array(current.n);
+  computeCentroids();
+  frame();
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufPos);
+  gl.bufferData(gl.ARRAY_BUFFER, current.pos, gl.STATIC_DRAW);
+
+  paint();   // calls applySelection() and uploads the colour/visibility buffers
+  updateStats();
+}
+
+/**
+ * Point the camera at the data rather than at the coordinate space.
+ *
+ * The packer quantises against each projection's *bounding box*, so framing
+ * the cube would be correct only if the points filled it. They do not: UMAP
+ * reliably strands a handful of outliers well away from everything else, which
+ * stretches the box while contributing nothing to look at, and the result is a
+ * map that loads as a small knot in the middle of an empty screen.
+ *
+ * So frame the 95th percentile of the distance from the centroid instead. The
+ * outliers are still drawn and still reachable by zooming out; they just stop
+ * dictating the opening shot.
+ */
+function frame() {
+  const n = current.n;
+  const mean = [0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    mean[0] += current.pos[i * 3];
+    mean[1] += current.pos[i * 3 + 1];
+    mean[2] += current.pos[i * 3 + 2];
+  }
+  for (let a = 0; a < 3; a++) mean[a] /= Math.max(n, 1);
+
+  const radii = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    radii[i] = Math.hypot(
+      current.pos[i * 3] - mean[0],
+      current.pos[i * 3 + 1] - mean[1],
+      current.pos[i * 3 + 2] - mean[2],
+    );
+  }
+  radii.sort();
+  const r = radii[Math.floor(n * 0.95)] || 100;
+
+  cam.target = mean;
+  // Vertical field of view is PI/4, so the half-angle is 22.5 degrees. The
+  // 1.15 is headroom so the outermost spheres are not clipped by the edge.
+  cam.distance = Math.min(3000, Math.max(20, (r / Math.tan(Math.PI / 8)) * 1.15));
+}
+
+/** Cluster centroids in world space, for label placement. */
+function computeCentroids() {
+  const acc = new Map();
+  for (let i = 0; i < current.n; i++) {
+    const c = current.cluster[i];
+    let a = acc.get(c);
+    if (!a) { a = [0, 0, 0, 0]; acc.set(c, a); }
+    a[0] += current.pos[i * 3];
+    a[1] += current.pos[i * 3 + 1];
+    a[2] += current.pos[i * 3 + 2];
+    a[3]++;
+  }
+  centroids = new Map();
+  for (const [c, a] of acc) centroids.set(c, [a[0] / a[3], a[1] / a[3], a[2] / a[3]]);
+}
+
+/**
+ * Recolour for the current selection.
+ *
+ * Unselected points are dimmed rather than hidden. Hiding them would let the
+ * selected cluster float in empty space with no sense of where it sits in the
+ * whole, which is exactly the context a map is for.
+ */
+function applySelection() {
+  const pal = current.palette;
+  for (let i = 0; i < current.n; i++) {
+    const c = current.cluster[i];
+    const dim = selected !== null && c !== selected;
+    const k = c * 3;
+    const f = dim ? 0.18 : 1.0;
+    colours[i * 3]     = pal[k] * f;
+    colours[i * 3 + 1] = pal[k + 1] * f;
+    colours[i * 3 + 2] = pal[k + 2] * f;
+    visible[i] = 1;
+  }
+}
+
+function paint() {
+  applySelection();
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufColor);
+  gl.bufferData(gl.ARRAY_BUFFER, colours, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufVisible);
+  gl.bufferData(gl.ARRAY_BUFFER, visible, gl.STATIC_DRAW);
+}
+
+// ---------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+  }
+}
+
+function render() {
+  if (!gl || !current) { requestAnimationFrame(render); return; }
+  resize();
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const mvp = viewProjection(canvas.clientWidth / Math.max(canvas.clientHeight, 1));
+
+  gl.useProgram(program);
+  gl.uniformMatrix4fv(uMVP, false, mvp);
+  gl.uniform1f(uSize, pointSize);
+
+  bind(bufPos, aPos, 3);
+  bind(bufColor, aColor, 3);
+  bind(bufVisible, aVisible, 1);
+  gl.drawArrays(gl.POINTS, 0, current.n);
+
+  drawLabels(mvp);
+  requestAnimationFrame(render);
+}
+
+function bind(buf, attr, size) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.enableVertexAttribArray(attr);
+  gl.vertexAttribPointer(attr, size, gl.FLOAT, false, 0, 0);
+}
+
+/**
+ * Position the cluster-name overlay.
+ *
+ * Only the largest clusters are named, plus the selected one whatever its
+ * size. Labelling all of them would produce a wall of overlapping text that
+ * hides the very structure the labels exist to explain — and past a couple of
+ * dozen names nobody reads them anyway.
+ *
+ * Cheap occlusion culling only: a label behind the camera is dropped, and one
+ * outside the viewport is skipped. Testing whether a name is buried inside the
+ * cloud would need a depth read back from the GPU every frame, which is a
+ * stall, for a label that the text-shadow already keeps legible.
+ */
+// A generous candidate pool, not a display count — collision rejection below
+// is what decides how many actually appear. Keeping the pool large is what
+// makes zooming in progressively reveal smaller topics as the centroids
+// separate, rather than showing the same fixed 20 names at every scale.
+const MAX_LABELS = 80;
+
+function drawLabels(mvp) {
+  const host = document.getElementById("labels");
+  if (!current || !centroids) { host.textContent = ""; return; }
+
+  const ranked = current.meta.clusters
+    .filter((c) => c.label && centroids.has(c.id))
+    .sort((a, b) => b.size - a.size)
+    .slice(0, MAX_LABELS);
+  if (selected !== null && !ranked.some((c) => c.id === selected)) {
+    const s = current.meta.clusters.find((c) => c.id === selected);
+    if (s && s.label && centroids.has(s.id)) ranked.push(s);
+  }
+
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  // Greedy screen-space collision rejection. Clusters are already ordered
+  // largest-first, so the biggest topic wins contested space and smaller ones
+  // yield — which is the right precedence, and it means the surviving labels
+  // change as you zoom in and the centroids spread apart. Without this the
+  // dense middle of the map is an unreadable pile of overlapping text, which
+  // hides exactly the structure the labels are there to explain.
+  const placed = [];
+  // Distinct clusters can share a label: c-TF-IDF names a cluster by its most
+  // distinguishing terms, and several small clusters can distinguish
+  // themselves the same way. Showing the same name three times reads as a
+  // rendering bug rather than as three genuinely separate regions, so only the
+  // largest keeps it.
+  const named = new Set();
+  const frag = document.createDocumentFragment();
+
+  for (const c of ranked) {
+    if (named.has(c.label) && c.id !== selected) continue;
+    const [x, y, z] = centroids.get(c.id);
+    const cw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+    if (cw <= 0) continue;   // behind the camera
+    const sx = ((mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12]) / cw * 0.5 + 0.5) * w;
+    const sy = (1 - ((mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13]) / cw * 0.5 + 0.5)) * h;
+    if (sx < -80 || sy < -20 || sx > w + 80 || sy > h + 20) continue;
+
+    // Width estimated from character count rather than measured: measuring
+    // means inserting each candidate and reading offsetWidth, which forces a
+    // synchronous layout per label per frame. The cost of being slightly wrong
+    // is a little extra whitespace, not a collision.
+    const halfW = c.label.length * 2.95 + 6, halfH = 9;
+    const hit = placed.some((q) =>
+      Math.abs(q.x - sx) < q.halfW + halfW && Math.abs(q.y - sy) < q.halfH + halfH);
+    // The selection is always drawn: it is the thing the viewer just asked
+    // about, so it outranks any size ordering.
+    if (hit && c.id !== selected) continue;
+    placed.push({ x: sx, y: sy, halfW, halfH });
+    named.add(c.label);
+
+    const el = document.createElement("div");
+    // textContent, not innerHTML: the label is c-TF-IDF output derived from
+    // document bodies, so it is corpus data and must never be parsed as markup.
+    el.textContent = c.label;
+    if (c.id === selected) el.className = "sel";
+    el.style.left = sx + "px";
+    el.style.top = sy + "px";
+    frag.appendChild(el);
+  }
+  host.textContent = "";
+  host.appendChild(frag);
+}
+
+// ---------------------------------------------------------------------------
+// Interaction
+// ---------------------------------------------------------------------------
+
+let dragging = false, dragged = false, lastX = 0, lastY = 0, panning = false;
+
+canvas.addEventListener("mousedown", (e) => {
+  dragging = true; dragged = false; panning = e.shiftKey;
+  lastX = e.clientX; lastY = e.clientY;
+  canvas.classList.add("dragging");
+});
+
+window.addEventListener("mouseup", () => {
+  dragging = false;
+  canvas.classList.remove("dragging");
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (!dragging) return;
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  if (Math.abs(dx) + Math.abs(dy) > 3) dragged = true;
+  lastX = e.clientX; lastY = e.clientY;
+
+  if (panning) {
+    // Pan in the camera's own screen plane, scaled by distance so the grab
+    // point stays under the cursor at any zoom.
+    const e3 = eye();
+    const fwd = norm3([cam.target[0] - e3[0], cam.target[1] - e3[1], cam.target[2] - e3[2]]);
+    const right = norm3(cross3(fwd, [0, 1, 0]));
+    const up = cross3(right, fwd);
+    const k = cam.distance * 0.0016;
+    for (let i = 0; i < 3; i++) cam.target[i] += (-dx * right[i] + dy * up[i]) * k;
+  } else {
+    cam.theta += dx * 0.006;
+    // Straight up is a singularity for the look-at basis; stop just short.
+    cam.phi = Math.min(Math.PI - PHI_LIMIT, Math.max(PHI_LIMIT, cam.phi - dy * 0.006));
+  }
+});
+
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  // Multiplicative rather than additive so a wheel notch moves the same
+  // *proportion* of the way in regardless of current distance — additive zoom
+  // crawls when far away and overshoots through the middle when close.
+  const factor = Math.exp(e.deltaY * 0.0012);
+  cam.distance = Math.min(3000, Math.max(20, cam.distance * factor));
+}, { passive: false });
+
+/**
+ * Nearest projected point to (mx, my), or -1.
+ *
+ * Picking by colour read-back would be exact but costs a framebuffer and a
+ * `readPixels` stall every frame the cursor moves; at these point sizes
+ * screen-space distance is indistinguishable in practice.
+ */
+const PICK_RADIUS = 14;
+
+function pick(mx, my, rect) {
+  if (!current) return -1;
+  const mvp = viewProjection(rect.width / Math.max(rect.height, 1));
+  const limit = PICK_RADIUS * PICK_RADIUS;
+  let best = -1, bestD = limit, bestDepth = Infinity;
+  for (let i = 0; i < current.n; i++) {
+    const x = current.pos[i * 3], y = current.pos[i * 3 + 1], z = current.pos[i * 3 + 2];
+    const w = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+    if (w <= 0) continue;   // behind the camera
+    const sx = ((mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12]) / w * 0.5 + 0.5) * rect.width;
+    const sy = (1 - ((mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13]) / w * 0.5 + 0.5)) * rect.height;
+    const d = (sx - mx) * (sx - mx) + (sy - my) * (sy - my);
+    // Ties on screen position go to the nearer point, so a dense region reads
+    // as the sphere in front rather than one buried behind it.
+    if (d < bestD || (d <= bestD && w < bestDepth)) {
+      best = i; bestD = d; bestDepth = w;
+    }
+  }
+  return best;
+}
+
+canvas.addEventListener("click", (e) => {
+  if (dragged || !current) return;
+  const rect = canvas.getBoundingClientRect();
+  const i = pick(e.clientX - rect.left, e.clientY - rect.top, rect);
+  selected = i >= 0 ? current.cluster[i] : null;
+  paint();
+  updateStats();
+});
+
+/**
+ * The hover card: the actual passage, plus whatever --meta-cols carried
+ * through, plus the cluster it landed in.
+ *
+ * This is the answer to "what *is* that dot", which is the first thing anyone
+ * asks of a point cloud and the one question a scatter plot cannot answer.
+ */
+const card = document.getElementById("card");
+
+function showCard(i, clientX, clientY) {
+  const row = DOCS[current.doc[i]];
+  if (current.doc[i] === NO_DOC || !row) { card.style.display = "none"; return; }
+
+  card.textContent = "";
+
+  const quote = document.createElement("div");
+  quote.className = "quote";
+  // textContent throughout: this is corpus data, and a document containing
+  // markup must be shown, not rendered.
+  quote.textContent = "“" + row[0] + "”";
+  card.appendChild(quote);
+
+  if (META_NAMES.length) {
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    // First meta column in bold, rest plain — for the demo corpus that reads
+    // as "**The Voyage of the Beagle** · Charles Darwin · CHAPTER 17".
+    META_NAMES.forEach((name, k) => {
+      const v = row[k + 1];
+      if (v === null || v === undefined || v === "") return;
+      if (meta.childNodes.length) meta.appendChild(document.createTextNode(" · "));
+      const el = document.createElement(k === 0 ? "b" : "span");
+      el.textContent = String(v);
+      meta.appendChild(el);
+    });
+    if (meta.childNodes.length) card.appendChild(meta);
+  }
+
+  const c = current.meta.clusters.find((x) => x.id === current.cluster[i]);
+  if (c && c.label) {
+    const topic = document.createElement("div");
+    topic.className = "topic";
+    topic.textContent = c.label + " · " + c.size.toLocaleString() + " points";
+    card.appendChild(topic);
+  }
+
+  // Placed after the content is in, so offsetWidth/Height are real and the
+  // card can be flipped rather than clipped at the right or bottom edge.
+  card.style.display = "block";
+  const pad = 16;
+  const w = card.offsetWidth, h = card.offsetHeight;
+  let x = clientX + pad, y = clientY + pad;
+  if (x + w > window.innerWidth - 8) x = clientX - w - pad;
+  if (y + h > window.innerHeight - 8) y = clientY - h - pad;
+  card.style.left = Math.max(8, x) + "px";
+  card.style.top = Math.max(8, y) + "px";
+}
+
+canvas.addEventListener("mousemove", (e) => {
+  // Dragging is a camera gesture; a card chasing the cursor through it is
+  // noise, and the pick would be against a stale frame anyway.
+  if (dragging) { card.style.display = "none"; return; }
+  const rect = canvas.getBoundingClientRect();
+  const i = pick(e.clientX - rect.left, e.clientY - rect.top, rect);
+  if (i < 0) { card.style.display = "none"; return; }
+  showCard(i, e.clientX, e.clientY);
+});
+
+canvas.addEventListener("mouseleave", () => { card.style.display = "none"; });
+
+document.getElementById("size").addEventListener("input", (e) => {
+  pointSize = Number(e.target.value);
+  document.getElementById("size-v").textContent = String(pointSize);
+});
+
+// ---------------------------------------------------------------------------
+// Panel
+// ---------------------------------------------------------------------------
+
+function updateStats() {
+  const m = current.meta;
+  document.getElementById("s-nodes").textContent = current.n.toLocaleString();
+  document.getElementById("s-clusters").textContent = m.clusters.length.toLocaleString();
+
+  // Noise is a result, not an omission. Roughly half of most corpora has no
+  // topic to belong to, and the alternative was HDBSCAN sweeping it all into
+  // one featureless mega-cluster, so the count is stated rather than hidden.
+  const dropped = (m.total || 0) - (m.kept || current.n);
+  document.getElementById("s-dropped").textContent = dropped > 0
+    ? `${dropped.toLocaleString()} in no cluster (${(dropped / m.total * 100).toFixed(0)}%), not shown`
+    : "";
+
+  const sel = selected === null ? null : m.clusters.find((c) => c.id === selected);
+  document.getElementById("s-selected").textContent = sel
+    ? `${sel.label || "cluster " + sel.id} · ${sel.size.toLocaleString()} points`
+    : "";
+  document.getElementById("s-terms").textContent =
+    sel && sel.terms ? sel.terms.join(" · ") : "";
+}
+
+function buildPanel() {
+  const names = Object.keys(PROJECTIONS);
+  if (!names.length) { fail("This bundle contains no projections."); return; }
+
+  document.getElementById("corpus").textContent = CORPUS;
+  const host = document.getElementById("facets");
+  // A single projection needs no switcher — the fieldset would be one radio
+  // button that does nothing.
+  if (names.length < 2) { host.hidden = true; }
+
+  for (const name of names) {
+    const label = document.createElement("label");
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "facet";
+    radio.value = name;
+    radio.checked = name === (names.includes("all") ? "all" : names[0]);
+    radio.addEventListener("change", () => { if (radio.checked) { load(name); } });
+
+    const text = document.createElement("span");
+    text.textContent = name;
+    const count = document.createElement("span");
+    count.className = "count";
+    count.textContent = PROJECTIONS[name].n.toLocaleString();
+
+    label.appendChild(radio);
+    label.appendChild(text);
+    label.appendChild(count);
+    host.appendChild(label);
+  }
+
+  load(names.includes("all") ? "all" : names[0]);
+}
+
+if (gl) {
+  try {
+    buildPanel();
+    render();
+  } catch (err) {
+    fail(String(err && err.message ? err.message : err));
+  }
+}
+</script>

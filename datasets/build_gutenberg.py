@@ -32,16 +32,49 @@ import psycopg
 # Chosen for topical distance from each other, not for literary merit. The
 # point is that a working pipeline must put the recipes, the beetles and the
 # submarines in different places.
+#: Titles here are checked against the ``Title:`` line of the download and the
+#: build aborts on a mismatch. That check exists because the first version of
+#: this list had two ids wrong — 10681 is Roget's Thesaurus, not Mrs Beeton —
+#: and the pipeline cheerfully clustered a thesaurus under "reference-cookery"
+#: without anything looking obviously broken. An id typo is invisible in the
+#: output; it just quietly makes the dataset a lie.
 BOOKS = [
     (1342, "Pride and Prejudice", "Jane Austen", "fiction-social"),
     (1661, "The Adventures of Sherlock Holmes", "Arthur Conan Doyle", "fiction-detective"),
     (164, "Twenty Thousand Leagues under the Sea", "Jules Verne", "fiction-adventure"),
     (2701, "Moby Dick", "Herman Melville", "fiction-adventure"),
     (1228, "On the Origin of Species", "Charles Darwin", "science-biology"),
-    (10136, "The Voyage of the Beagle", "Charles Darwin", "science-travel"),
-    (10681, "The Book of Household Management", "Isabella Beeton", "reference-cookery"),
+    (944, "The Voyage of the Beagle", "Charles Darwin", "science-travel"),
+    (10136, "The Book of Household Management", "Isabella Beeton", "reference-cookery"),
     (2680, "Meditations", "Marcus Aurelius", "philosophy"),
 ]
+
+TITLE_RE = re.compile(r"^Title:\s*(.+)$", re.M)
+#: Checked as well as the title, because titles alone are not unique.
+#: "Meditations" is Marcus Aurelius here and Descartes elsewhere, and a
+#: title-only assertion would have waved either one through.
+AUTHOR_RE = re.compile(r"^Author:\s*(.+)$", re.M)
+
+#: Surname is enough. Gutenberg's Author line carries titles and honorifics
+#: that no sane BOOKS entry would reproduce — "Emperor of Rome Marcus
+#: Aurelius", "Mrs. Beeton" — so matching the full string would fail on books
+#: that are perfectly correct.
+def _surname(name: str) -> str:
+    return name.strip().rstrip(".").split()[-1].lower()
+
+#: Gutenberg plain text has no page numbers — pagination is a property of a
+#: printed edition and does not survive the conversion. Chapter headings do,
+#: and they are the only structural landmark available, so they are what the
+#: viewer's hover card shows. Forms vary by book: "CHAPTER 32. Cetology.",
+#: "CHAPTER IV.", "LETTER 3", and Beeton's "GENERAL OBSERVATIONS ON ...".
+#: The roman-numeral alternative requires a title after the numeral. Bare
+#: "II." markers divide the sections *within* a Holmes story, and matching
+#: those would replace the story's name with a numeral halfway through it.
+CHAPTER_RE = re.compile(
+    r"^\s*((?:CHAPTER|Chapter|BOOK|Book|LETTER|Letter|PART|Part)\b[^\n]{0,80}"
+    r"|[IVXLC]+\.\s+[A-Z][A-Z0-9 ,'\-]{4,80}"
+    r"|[A-Z][A-Z ,'\-]{12,80})\s*$"
+)
 
 GUTENBERG_URL = "https://www.gutenberg.org/cache/epub/{id}/pg{id}.txt"
 
@@ -63,6 +96,7 @@ CREATE TABLE IF NOT EXISTS documents (
     title       text        NOT NULL,
     author      text        NOT NULL,
     category    text        NOT NULL,
+    chapter     text,
     seq         integer     NOT NULL,
     content     text        NOT NULL,
     embedding   vector({dims})
@@ -112,19 +146,33 @@ def paragraphs(text: str):
     Gutenberg plain text is wrapped at ~70 characters, so a naive line-based
     split would cut sentences in half and produce fragments that embed as
     nonsense.
+
+    Yields ``(chapter, paragraph)``, carrying the most recent heading forward.
     """
+    chapter = None
     for block in re.split(r"\n\s*\n", text):
+        stripped = block.strip()
+        # A heading is its own short block. Test before rejoining, because
+        # rejoining a multi-line block would destroy the single-line shape the
+        # pattern relies on.
+        if "\n" not in stripped and (m := CHAPTER_RE.match(stripped)):
+            chapter = " ".join(m.group(1).split())
+            continue
+
         joined = " ".join(line.strip() for line in block.splitlines())
         joined = re.sub(r"\s+", " ", joined).strip()
         if joined:
-            yield joined
+            yield chapter, joined
 
 
 def passages(text: str, max_chars: int, min_chars: int):
-    """Consecutive sentences glued up to max_chars, never crossing a paragraph."""
-    for para in paragraphs(text):
-        # Chapter headings, roman numerals, all-caps front matter: too short to
-        # have a topic, and they cluster on their own formatting.
+    """Consecutive sentences glued up to max_chars, never crossing a paragraph.
+
+    Yields ``(chapter, passage)``.
+    """
+    for chapter, para in paragraphs(text):
+        # Roman numerals, all-caps front matter and stray headings: too short
+        # to have a topic, and they cluster on their own formatting.
         if len(para) < min_chars:
             continue
         buf = ""
@@ -133,12 +181,12 @@ def passages(text: str, max_chars: int, min_chars: int):
             if not sentence:
                 continue
             if buf and len(buf) + 1 + len(sentence) > max_chars:
-                yield buf
+                yield chapter, buf
                 buf = sentence
             else:
                 buf = f"{buf} {sentence}".strip()
         if len(buf) >= min_chars:
-            yield buf
+            yield chapter, buf
 
 
 def main() -> int:
@@ -170,6 +218,25 @@ def main() -> int:
                 log(f"!! skipping {title}: {e}")
                 continue
 
+            # Verify we downloaded the book we think we did. Without this an id
+            # typo is completely silent: the pipeline runs, the clusters look
+            # plausible, and the dataset is simply mislabelled.
+            found = TITLE_RE.search(raw)
+            actual = found.group(1).strip() if found else "(no Title: line)"
+            if not actual.lower().startswith(title.lower()[:20]):
+                raise SystemExit(
+                    f"ebook {book_id} is titled '{actual}', not '{title}'. "
+                    f"Fix the id in BOOKS rather than the expected title."
+                )
+
+            found = AUTHOR_RE.search(raw)
+            actual_author = found.group(1).strip() if found else ""
+            if actual_author and _surname(actual_author) != _surname(author):
+                raise SystemExit(
+                    f"ebook {book_id} is by '{actual_author}', not '{author}'. "
+                    f"Fix the id in BOOKS rather than the expected author."
+                )
+
             chunks = list(passages(strip_licence(raw), a.max_chars, a.min_chars))
             if len(chunks) > a.per_book:
                 # Even stride rather than head-truncation: taking the first N
@@ -181,11 +248,11 @@ def main() -> int:
             with conn.cursor() as cur:
                 cur.executemany(
                     "INSERT INTO documents "
-                    "(book_id, title, author, category, seq, content) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    "(book_id, title, author, category, chapter, seq, content) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                     [
-                        (book_id, title, author, category, i, c)
-                        for i, c in enumerate(chunks)
+                        (book_id, title, author, category, chapter, i, c)
+                        for i, (chapter, c) in enumerate(chunks)
                     ],
                 )
             conn.commit()

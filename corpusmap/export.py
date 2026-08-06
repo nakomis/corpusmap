@@ -68,6 +68,50 @@ def projection_doc(
     }
 
 
+def write_docs(
+    out_dir: str | Path,
+    prefix: str,
+    docs: list[dict],
+    text_by_id: dict[str, str],
+    meta_by_id: dict[str, list],
+    meta_names: list[str],
+    snippet_chars: int = 320,
+) -> Path:
+    """Write the hover-card text table, shared across every facet.
+
+    Deduplicated deliberately. A document appears in its own facet's projection
+    *and* in ``all``, so storing the text per node would carry most of the
+    corpus twice; keying it by document id instead means the second appearance
+    costs a 4-byte index.
+
+    Snippets are truncated because this is a hover card, not a reader. The
+    passages in the demo corpus run to 600 characters and the full text of
+    ~12,000 of them would roughly double the size of a self-contained artefact
+    that is otherwise a couple of hundred kilobytes.
+    """
+    wanted: set[str] = set()
+    for doc in docs:
+        for node in doc.get("nodes", []):
+            wanted.add(node["id"])
+
+    table: dict[str, list] = {}
+    for doc_id in wanted:
+        body = text_by_id.get(doc_id) or ""
+        snippet = body[:snippet_chars]
+        if len(body) > snippet_chars:
+            snippet = snippet.rstrip() + "…"
+        table[doc_id] = [snippet, *meta_by_id.get(doc_id, [])]
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"{prefix}-docs.json"
+    path.write_text(
+        json.dumps({"meta_names": meta_names, "docs": table}, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return path
+
+
 def write(
     out_dir: str | Path,
     prefix: str,

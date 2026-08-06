@@ -46,6 +46,10 @@ class Corpus:
     vector_col: str = "embedding"
     facet_col: str | None = None
     where: str | None = None
+    #: Extra columns carried through to the viewer's hover card — title,
+    #: author, url, timestamp, whatever identifies a document to a human.
+    #: They are never used by the mathematics, only displayed.
+    meta_cols: tuple[str, ...] = ()
 
     def _predicate(self) -> str:
         clauses = [f"{self.vector_col} IS NOT NULL"]
@@ -111,6 +115,24 @@ def fetch_text(corpus: Corpus) -> dict[str, str]:
         out = {row[0]: row[1] for row in cur}
     _log(f"fetched {len(out):,} text bodies in {time.perf_counter() - t0:.0f}s")
     return out
+
+
+def fetch_meta(corpus: Corpus) -> dict[str, list]:
+    """Read the display-only columns, keyed by id.
+
+    Returns an empty mapping when no ``meta_cols`` are configured, so callers
+    never have to special-case the common setup.
+    """
+    if not corpus.meta_cols:
+        return {}
+    cols = ", ".join(corpus.meta_cols)
+    sql = (
+        f"SELECT {corpus.id_col}::text, {cols} "
+        f"FROM {corpus.table} WHERE {corpus._predicate()}"
+    )
+    with psycopg.connect(corpus.dsn) as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        return {row[0]: list(row[1:]) for row in cur}
 
 
 def _register_vector(conn: psycopg.Connection) -> None:

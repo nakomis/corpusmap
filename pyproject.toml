@@ -33,5 +33,10 @@ Dataset = "https://github.com/nakomis/corpusmap/releases/latest"
 [tool.setuptools.packages.find]
 include = ["corpusmap*"]
 
+# The viewer template ships inside the package: `corpusmap view` reads it at
+# runtime, so an install without it produces a working CLI that cannot render.
+[tool.setuptools.package-data]
+corpusmap = ["viewer.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
