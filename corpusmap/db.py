@@ -70,9 +70,23 @@ def fetch(corpus: Corpus) -> tuple[list[str], np.ndarray, list[str | None]]:
     five-facet run done that way costs five times the wait for no benefit.
     """
     facet_expr = f", {corpus.facet_col}::text" if corpus.facet_col else ""
+    # ORDER BY is load-bearing, not tidiness.
+    #
+    # UMAP and HDBSCAN both depend on the order their input arrives in, so the
+    # fixed `random_state` only buys reproducibility if the rows are in a fixed
+    # order too. Without this clause Postgres is free to return them in
+    # physical heap order, which is not id order and not stable: `corpusmap
+    # embed` UPDATEs every row, rewriting tuples and reshuffling the heap, and
+    # autovacuum can move them again afterwards.
+    #
+    # Measured on the demo corpus: the same 15,534 documents, same seed and
+    # same code produced 53 clusters / 8,974 kept on one run and 51 clusters /
+    # 9,553 kept on another, hours apart, purely because the heap had settled
+    # in between. Nothing warned; both runs looked entirely healthy.
     sql = (
         f"SELECT {corpus.id_col}::text, {corpus.vector_col}{facet_expr} "
-        f"FROM {corpus.table} WHERE {corpus._predicate()}"
+        f"FROM {corpus.table} WHERE {corpus._predicate()} "
+        f"ORDER BY {corpus.id_col}"
     )
 
     t0 = time.perf_counter()

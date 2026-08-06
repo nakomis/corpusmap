@@ -127,3 +127,74 @@ class TestFacets:
     def test_no_facet_values_still_yields_all(self, values):
         out = facets(list(range(len(values))), np.zeros((len(values), 2)), values)
         assert [n for n, _ in out] == ["all"]
+
+
+class TestFetchOrdering:
+    """The fetch must impose an order, or the fixed seed guarantees nothing.
+
+    UMAP and HDBSCAN both depend on the order their input arrives in. Without
+    an ORDER BY, Postgres returns rows in physical heap order — which is not id
+    order, and is not stable, because `corpusmap embed` UPDATEs every row and
+    autovacuum can reshuffle them afterwards.
+
+    Measured on the demo corpus before this was fixed: the same 15,534
+    documents, same seed and same code gave 53 clusters / 8,974 kept on one run
+    and 51 / 9,553 on another. Both runs looked entirely healthy.
+
+    These assert against the SQL `db.fetch` actually issues, by standing a fake
+    connection in front of psycopg. Rebuilding the query string in the test
+    would pass even if the clause were deleted from the source, which is the
+    one thing this must never do.
+    """
+
+    @staticmethod
+    def _captured_sql(monkeypatch, **corpus_kw):
+        import corpusmap.db as db
+
+        seen = {}
+
+        class FakeCursor:
+            def execute(self, sql):
+                seen["sql"] = " ".join(sql.split())
+
+            def fetchall(self):
+                # One row, so fetch() gets past its "no rows" guard. Three
+                # columns because fetch reads r[2] whenever a facet column is
+                # configured — a two-column fake passes the no-facet tests and
+                # then IndexErrors on the faceted one.
+                return [("1", [0.0, 1.0], "cat")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class FakeConn:
+            def cursor(self):
+                return FakeCursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(db.psycopg, "connect", lambda dsn: FakeConn())
+        db.fetch(db.Corpus(dsn="postgresql:///x", **corpus_kw))
+        return seen["sql"]
+
+    def test_fetch_orders_by_id(self, monkeypatch):
+        sql = self._captured_sql(monkeypatch)
+        assert sql.upper().endswith("ORDER BY ID")
+
+    def test_ordering_uses_the_configured_id_column(self, monkeypatch):
+        sql = self._captured_sql(monkeypatch, id_col="doc_pk")
+        assert sql.endswith("ORDER BY doc_pk")
+
+    def test_ordering_survives_facets_and_a_where_clause(self, monkeypatch):
+        sql = self._captured_sql(
+            monkeypatch, facet_col="category", where="seq > 10"
+        )
+        assert "category::text" in sql and "seq > 10" in sql
+        assert sql.endswith("ORDER BY id")
